@@ -72,19 +72,18 @@ class ComplexImpedanceMapper(nn.Module):
             complex_impedances: 复阻抗 Z = R + jX，形状 [num_modules, 2] (R, X)
             impedance_info: 额外信息字典包含 |Z|, arg(Z) 等
         """
-        resistance = nn.functional.softplus(
-            decay_magnitudes, beta=self.impedance_softplus_beta
-        )
+        resistance = decay_magnitudes.clamp(min=1e-12)
 
         phase_contribution = self.phase_to_reactance * phase_shifts
-        coupling_contribution = self.coupling_weights.sum(dim=0) * 0.1
+        coupling_contribution = self.coupling_weights.sum(dim=0) * 0.01
 
         raw_reactance = (
             self.reactance_bias
             + phase_contribution
             + self.phase_coupling_strength * coupling_contribution
         )
-        reactance = torch.tanh(raw_reactance / self.reactance_range) * self.reactance_range
+        reactance_scale = self.reactance_range * decay_magnitudes.detach().clamp(min=1e-6)
+        reactance = torch.tanh(raw_reactance) * reactance_scale
 
         impedance_magnitude = torch.sqrt(resistance ** 2 + reactance ** 2)
         impedance_angle = torch.atan2(reactance, resistance)

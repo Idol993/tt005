@@ -111,8 +111,9 @@ class ResonanceSuppressor(nn.Module):
 
         freq_similarity = torch.exp(-(freq_diff ** 2) / (2 * self.frequency_threshold ** 2))
 
+        current_total_phases = base_phase_shifts + self.correction_phases
         phase_diff = torch.abs(
-            base_phase_shifts.unsqueeze(0) - base_phase_shifts.unsqueeze(1)
+            current_total_phases.unsqueeze(0) - current_total_phases.unsqueeze(1)
         )
         phase_diff = torch.minimum(phase_diff, 2 * math.pi - phase_diff)
 
@@ -130,31 +131,31 @@ class ResonanceSuppressor(nn.Module):
 
         per_module_resonance = self.resonance_counters.sum(dim=1)
 
-        phase_corrections = torch.zeros_like(base_phase_shifts)
+        phase_increment = torch.zeros_like(base_phase_shifts)
         for i in range(self.num_modules):
             for j in range(self.num_modules):
                 if i == j or self.adjacency[i, j] < 0.5:
                     continue
                 if self.resonance_counters[i, j] > 0.3:
                     if per_module_resonance[i] >= per_module_resonance[j]:
-                        sign = 1.0 if torch.rand(1).item() > 0.5 else -1.0
-                        target_shift = sign * self.max_phase_shift * min(
-                            self.resonance_counters[i, j], 1.0
-                        )
-                        current_correction = self.correction_phases[i]
-                        new_correction = (
-                            1.0 - self.adaptivity_rate
-                        ) * current_correction + self.adaptivity_rate * target_shift
-                        phase_corrections[i] += new_correction - current_correction
+                        current_phase_i = self.correction_phases[i].item()
+                        current_phase_j = self.correction_phases[j].item()
+                        phase_ij = current_phase_i - current_phase_j
+                        sign = 1.0 if phase_ij >= 0 else -1.0
 
-        self.accumulated_phase_shifts.add_(phase_corrections.detach())
-        self.accumulated_phase_shifts = torch.clamp(
-            self.accumulated_phase_shifts,
-            -2 * math.pi,
-            2 * math.pi,
-        )
+                        strength = min(self.resonance_counters[i, j].item(), 1.0)
+                        increment = sign * self.max_phase_shift * strength * self.adaptivity_rate
+                        phase_increment[i] += increment
 
-        corrected_phases = base_phase_shifts + self.correction_phases + phase_corrections
+        with torch.no_grad():
+            self.correction_phases.add_(phase_increment)
+            self.correction_phases.copy_(
+                torch.clamp(self.correction_phases, -2 * math.pi, 2 * math.pi)
+            )
+
+        self.accumulated_phase_shifts.copy_(self.correction_phases.detach())
+
+        corrected_phases = base_phase_shifts + self.correction_phases
 
         resonance_suppression = 1.0 - self.suppression_strength * per_module_resonance.clamp(
             0.0, 1.0

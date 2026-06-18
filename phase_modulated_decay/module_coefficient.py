@@ -42,7 +42,7 @@ class ModuleDecayCoefficient(nn.Module):
         input_dim = 2 + phase_encoding_dim
 
         self.module_nets = nn.ModuleList()
-        for _ in range(num_modules):
+        for i in range(num_modules):
             net = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim, **factory_kwargs),
                 nn.SiLU(),
@@ -50,6 +50,10 @@ class ModuleDecayCoefficient(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, 2, **factory_kwargs),
             )
+            nn.init.normal_(net[-1].weight, mean=0.0, std=0.01)
+            init_bias = -3.0 + (i - num_modules / 2) * 0.5
+            nn.init.constant_(net[-1].bias[0], init_bias)
+            nn.init.constant_(net[-1].bias[1], 0.0)
             self.module_nets.append(net)
 
         self.register_buffer(

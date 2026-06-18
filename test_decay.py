@@ -247,6 +247,195 @@ def test_decay_parameters_interface():
     print("  PASSED")
 
 
+def test_small_base_decay_not_amplified():
+    print("Test 8: Small base_decay is not anomalously amplified")
+
+    base_decay = 1e-4
+
+    class SimpleModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = nn.Linear(10, 20)
+            self.layer2 = nn.Linear(20, 15)
+            self.layer3 = nn.Linear(15, 5)
+        def forward(self, x):
+            x = torch.relu(self.layer1(x))
+            x = torch.relu(self.layer2(x))
+            return self.layer3(x)
+
+    model = SimpleModel()
+    pmwd = PhaseModulatedWeightDecay(
+        modules=model,
+        base_decay=base_decay,
+        num_frequencies=4,
+    )
+
+    X = torch.randn(32, 10)
+    y = torch.randint(0, 5, (32,))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    max_allowed = base_decay * 10.0
+    min_allowed = base_decay * 0.01
+
+    decay_records = {name: [] for name in pmwd._module_names}
+
+    for step in range(100):
+        optimizer.zero_grad()
+        loss = criterion(model(X), y)
+        loss.backward()
+        optimizer.step()
+
+        progress = step / 100
+        info = pmwd.apply_decay(progress, return_info=True)
+
+        for name, decay in pmwd.get_module_decays().items():
+            decay_records[name].append(decay)
+
+        if step % 20 == 0:
+            for name, decay in pmwd.get_module_decays().items():
+                assert decay >= min_allowed * 0.99, f"{name} decay {decay:.6e} too small, min={min_allowed:.6e}"
+                assert decay <= max_allowed * 1.01, f"{name} decay {decay:.6e} too large, max={max_allowed:.6e}"
+
+    final_decays = pmwd.get_module_decays()
+    print(f"  Final decays:")
+    for name, decay in final_decays.items():
+        print(f"    {name}: {decay:.6e} (base={base_decay:.6e})")
+        assert decay >= min_allowed * 0.99, f"{name} decay {decay:.6e} too small"
+        assert decay <= max_allowed * 1.01, f"{name} decay {decay:.6e} too large"
+
+    decay_values = list(final_decays.values())
+    decay_range = max(decay_values) / (min(decay_values) + 1e-12)
+    print(f"  Decay ratio (max/min): {decay_range:.2f}x")
+
+    mean_decay = sum(decay_values) / len(decay_values)
+    for v in decay_values:
+        rel_diff = abs(v - mean_decay) / (mean_decay + 1e-12)
+        print(f"    Relative diff from mean: {rel_diff:.2%}")
+
+    print("  PASSED")
+
+
+def test_energy_consistency_final_decay():
+    print("Test 9: Energy consistency with target_total_energy")
+
+    target_energy = 0.001
+
+    model = nn.Sequential(
+        OrderedDict([
+            ("layer1", nn.Linear(10, 20)),
+            ("layer2", nn.Linear(20, 15)),
+            ("layer3", nn.Linear(15, 5)),
+        ])
+    )
+
+    pmwd = PhaseModulatedWeightDecay(
+        modules=model,
+        base_decay=1e-4,
+        target_total_energy=target_energy,
+    )
+
+    X = torch.randn(64, 10)
+    y = torch.randint(0, 5, (64,))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    for step in range(50):
+        optimizer.zero_grad()
+        loss = criterion(model(X), y)
+        loss.backward()
+        optimizer.step()
+
+        progress = step / 50
+        info = pmwd.apply_decay(progress, return_info=True)
+
+        if step >= 40:
+            reported_energy = info["energy_info"]["final_energy"]
+
+            weights = torch.softmax(pmwd.energy_regulator.module_weights, dim=0)
+            param_norms = info["param_norms"]
+            final_decays = info["final_decays"]
+
+            recomputed_energy = (weights.cpu() * final_decays * (param_norms ** 2)).sum().item()
+
+            rel_error = abs(reported_energy - recomputed_energy) / (abs(reported_energy) + 1e-12)
+            print(f"  Step {step}: reported={reported_energy:.6e}, recomputed={recomputed_energy:.6e}, rel_error={rel_error:.2%}")
+
+            assert rel_error < 0.001, (
+                f"Energy mismatch at step {step}: "
+                f"reported={reported_energy:.6e}, recomputed={recomputed_energy:.6e}"
+            )
+
+            target_error = abs(reported_energy - target_energy) / (target_energy + 1e-12)
+            print(f"    Target error: {target_error:.2%}")
+
+    print("  PASSED")
+
+
+def test_resonance_phase_continuous_adjustment():
+    print("Test 10: Resonance phase shifts accumulate continuously")
+
+    num_modules = 3
+
+    suppressor = ResonanceSuppressor(
+        num_modules=num_modules,
+        frequency_threshold=0.2,
+        max_phase_shift=1.0,
+        adaptivity_rate=0.2,
+    )
+
+    decays = torch.ones(num_modules) * 1e-4
+    base_phases = torch.zeros(num_modules)
+
+    oscillation_freqs = torch.tensor([0.25, 0.26, 0.5])
+
+    phase_history = []
+    resonance_history = []
+    risk_history = []
+
+    for step in range(50):
+        corrected_decays, corrected_phases, res_map = suppressor(decays, base_phases, oscillation_freqs)
+
+        corr_phases_np = suppressor.correction_phases.detach().clone()
+        phase_history.append(corr_phases_np)
+        resonance_history.append(res_map[0, 1].item())
+
+        phase_diff = abs(corr_phases_np[0] - corr_phases_np[1])
+        phase_diff = min(phase_diff, 2 * math.pi - phase_diff)
+        freq_diff = abs(oscillation_freqs[0] - oscillation_freqs[1])
+        freq_similarity = math.exp(-(freq_diff ** 2) / (2 * 0.2 ** 2))
+        risk = freq_similarity * math.exp(-(phase_diff ** 2) / (2 * (math.pi/4) ** 2))
+        risk_history.append(risk)
+
+        if step % 10 == 0:
+            print(f"  Step {step}:")
+            print(f"    correction_phases: {corr_phases_np.tolist()}")
+            print(f"    resonance[0,1]: {res_map[0, 1].item():.4f}")
+            print(f"    risk: {risk:.4f}")
+
+    phase_history = torch.stack(phase_history)
+    phase_changes_0 = torch.abs(phase_history[1:, 0] - phase_history[:-1, 0])
+    phase_changes_1 = torch.abs(phase_history[1:, 1] - phase_history[:-1, 1])
+
+    total_change_0 = phase_changes_0.sum().item()
+    total_change_1 = phase_changes_1.sum().item()
+    print(f"  Total phase change - module 0: {total_change_0:.4f}, module 1: {total_change_1:.4f}")
+
+    assert total_change_0 > 0.05 or total_change_1 > 0.05, (
+        f"Phase shifts should accumulate. Got {total_change_0:.4f} and {total_change_1:.4f}"
+    )
+
+    initial_risk = risk_history[0]
+    final_risk = risk_history[-1]
+    print(f"  Risk change: {initial_risk:.4f} -> {final_risk:.4f}")
+
+    assert final_risk < initial_risk * 0.9 or final_risk < 0.3, (
+        f"Resonance risk should decrease. Initial={initial_risk:.4f}, Final={final_risk:.4f}"
+    )
+
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     print("Running unit tests...\n")
 
@@ -258,6 +447,9 @@ if __name__ == "__main__":
         test_energy_conservation()
         test_end_to_end()
         test_decay_parameters_interface()
+        test_small_base_decay_not_amplified()
+        test_energy_consistency_final_decay()
+        test_resonance_phase_continuous_adjustment()
 
         print("\n" + "=" * 50)
         print("All tests PASSED!")

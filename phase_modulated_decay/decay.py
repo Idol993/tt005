@@ -198,18 +198,37 @@ class PhaseModulatedWeightDecay(nn.Module):
             self.impedance_mapper(suppressed_decays, suppressed_phases)
         )
 
-        final_decays, energy_info = self.energy_regulator(
-            effective_decays, param_norms, grad_norms
-        )
-
-        if not self.learnable_decay:
-            final_decays = torch.ones_like(final_decays) * self.base_decay
-
         max_allowed_decay = self.base_decay * 10.0
         min_allowed_decay = self.base_decay * 0.01
-        final_decays = torch.clamp(final_decays, min_allowed_decay, max_allowed_decay)
+
+        if not self.learnable_decay:
+            final_decays = torch.ones_like(effective_decays) * self.base_decay
+            weights = torch.softmax(self.energy_regulator.module_weights, dim=0)
+            per_module_energy = weights * final_decays * (param_norms ** 2)
+            total_energy = per_module_energy.sum()
+            energy_info = {
+                "initial_energy": total_energy.item(),
+                "target_energy": total_energy.item(),
+                "final_energy": total_energy.item(),
+                "deviation_ratio": 0.0,
+                "scale_factor": 1.0,
+                "per_module_energy": per_module_energy.detach().cpu().tolist(),
+                "module_weights": weights.detach().cpu().tolist(),
+            }
+        else:
+            clamped_decays = torch.clamp(effective_decays, min_allowed_decay, max_allowed_decay)
+            final_decays, energy_info = self.energy_regulator(
+                clamped_decays, param_norms, grad_norms
+            )
 
         self._current_decays = final_decays.detach().clone()
+
+        recomputed_energy = (
+            torch.softmax(self.energy_regulator.module_weights, dim=0)
+            * final_decays
+            * (param_norms ** 2)
+        ).sum()
+        energy_info["final_energy"] = recomputed_energy.item()
 
         info = {
             "phase_encoding": phase_encoding.detach().cpu(),
