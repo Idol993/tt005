@@ -373,65 +373,260 @@ def test_energy_consistency_final_decay():
 
 
 def test_resonance_phase_continuous_adjustment():
-    print("Test 10: Resonance phase shifts accumulate continuously")
+    print("Test 10: Two-module exact same freq (minimal scenario)")
 
-    num_modules = 3
-
+    num_modules = 2
     suppressor = ResonanceSuppressor(
         num_modules=num_modules,
-        frequency_threshold=0.2,
+        frequency_threshold=0.3,
         max_phase_shift=1.0,
-        adaptivity_rate=0.2,
+        adaptivity_rate=0.3,
     )
 
     decays = torch.ones(num_modules) * 1e-4
     base_phases = torch.zeros(num_modules)
-
-    oscillation_freqs = torch.tensor([0.25, 0.26, 0.5])
+    oscillation_freqs = torch.tensor([0.25, 0.25])
 
     phase_history = []
-    resonance_history = []
     risk_history = []
 
     for step in range(50):
-        corrected_decays, corrected_phases, res_map = suppressor(decays, base_phases, oscillation_freqs)
+        suppressor(decays, base_phases, oscillation_freqs)
+        cp = suppressor.correction_phases.detach().clone()
+        phase_history.append(cp)
 
-        corr_phases_np = suppressor.correction_phases.detach().clone()
-        phase_history.append(corr_phases_np)
-        resonance_history.append(res_map[0, 1].item())
-
-        phase_diff = abs(corr_phases_np[0] - corr_phases_np[1])
-        phase_diff = min(phase_diff, 2 * math.pi - phase_diff)
-        freq_diff = abs(oscillation_freqs[0] - oscillation_freqs[1])
-        freq_similarity = math.exp(-(freq_diff ** 2) / (2 * 0.2 ** 2))
-        risk = freq_similarity * math.exp(-(phase_diff ** 2) / (2 * (math.pi/4) ** 2))
+        phase_diff_raw = cp[0] - cp[1]
+        phase_diff = min(abs(phase_diff_raw.item()), 2 * math.pi - abs(phase_diff_raw.item()))
+        fd = abs(oscillation_freqs[0] - oscillation_freqs[1]).item()
+        fs = math.exp(-(fd ** 2) / (2 * 0.3 ** 2))
+        risk = fs * math.exp(-(phase_diff ** 2) / (2 * (math.pi / 4) ** 2))
         risk_history.append(risk)
 
         if step % 10 == 0:
-            print(f"  Step {step}:")
-            print(f"    correction_phases: {corr_phases_np.tolist()}")
-            print(f"    resonance[0,1]: {res_map[0, 1].item():.4f}")
-            print(f"    risk: {risk:.4f}")
+            print(f"  Step {step:2d}: cp=[{cp[0]:+.4f}, {cp[1]:+.4f}], "
+                  f"|diff|={phase_diff:.4f}, risk={risk:.4f}")
 
     phase_history = torch.stack(phase_history)
-    phase_changes_0 = torch.abs(phase_history[1:, 0] - phase_history[:-1, 0])
-    phase_changes_1 = torch.abs(phase_history[1:, 1] - phase_history[:-1, 1])
 
-    total_change_0 = phase_changes_0.sum().item()
-    total_change_1 = phase_changes_1.sum().item()
-    print(f"  Total phase change - module 0: {total_change_0:.4f}, module 1: {total_change_1:.4f}")
+    print(f"\n  Check 1: Only ONE module moves (deterministic j-only rule)")
+    changes_0 = (phase_history[1:, 0] - phase_history[:-1, 0]).abs()
+    changes_1 = (phase_history[1:, 1] - phase_history[:-1, 1]).abs()
+    total_0 = changes_0.sum().item()
+    total_1 = changes_1.sum().item()
+    print(f"    Module 0 total change: {total_0:.4f}")
+    print(f"    Module 1 total change: {total_1:.4f}")
+    assert total_0 < 1e-6, f"Module 0 (i) should NOT move. Got {total_0:.6f}"
+    assert total_1 > 0.5, f"Module 1 (j) should move significantly. Got {total_1:.6f}"
 
-    assert total_change_0 > 0.05 or total_change_1 > 0.05, (
-        f"Phase shifts should accumulate. Got {total_change_0:.4f} and {total_change_1:.4f}"
-    )
+    print(f"\n  Check 2: Phase difference strictly increases")
+    diffs = (phase_history[:, 1] - phase_history[:, 0]).abs()
+    strictly_increasing = all(diffs[i+1] >= diffs[i] - 1e-6 for i in range(len(diffs)-1))
+    print(f"    Phase diff sequence: {diffs[:5].tolist()} ... {diffs[-3:].tolist()}")
+    print(f"    Strictly increasing: {strictly_increasing}")
+    assert strictly_increasing, "Phase diff should never decrease (monotonic accumulation)"
 
+    print(f"\n  Check 3: Risk drops and stays low (no rebound)")
     initial_risk = risk_history[0]
+    mid_risk = risk_history[len(risk_history) // 2]
     final_risk = risk_history[-1]
-    print(f"  Risk change: {initial_risk:.4f} -> {final_risk:.4f}")
-
-    assert final_risk < initial_risk * 0.9 or final_risk < 0.3, (
-        f"Resonance risk should decrease. Initial={initial_risk:.4f}, Final={final_risk:.4f}"
+    print(f"    Risk: {initial_risk:.4f} -> {mid_risk:.4f} -> {final_risk:.4f}")
+    assert final_risk < initial_risk * 0.5, (
+        f"Risk should drop >50%. Init={initial_risk:.4f}, Final={final_risk:.4f}"
     )
+    assert final_risk < mid_risk * 1.05, (
+        f"Risk should not rebound after midpoint. Mid={mid_risk:.4f}, Final={final_risk:.4f}"
+    )
+
+    print(f"\n  Check 4: accumulated_phases matches correction_phases")
+    summary = suppressor.get_resonance_summary()
+    assert summary["accumulated_phases"][1] > 0.5, "accumulated_phases should reflect growth"
+    assert abs(summary["accumulated_phases"][0] - cp[0].item()) < 1e-6
+    assert abs(summary["accumulated_phases"][1] - cp[1].item()) < 1e-6
+
+    print("  PASSED")
+
+
+def test_multi_module_multi_group_resonance():
+    print("Test 11: Multi-module multi-group resonance (direction consistency)")
+
+    num_modules = 4
+    suppressor = ResonanceSuppressor(
+        num_modules=num_modules,
+        frequency_threshold=0.3,
+        max_phase_shift=1.0,
+        adaptivity_rate=0.3,
+    )
+
+    decays = torch.ones(num_modules) * 1e-4
+    base_phases = torch.zeros(num_modules)
+    oscillation_freqs = torch.tensor([0.25, 0.25, 0.25, 0.5])
+
+    phase_history = []
+    for step in range(60):
+        suppressor(decays, base_phases, oscillation_freqs)
+        phase_history.append(suppressor.correction_phases.detach().tolist().copy())
+
+    print(f"  Final phases: {phase_history[-1]}")
+
+    print(f"\n  Check 1: Module 0 never moves (no left neighbor)")
+    mod0_series = [p[0] for p in phase_history]
+    assert all(abs(m - mod0_series[0]) < 1e-6 for m in mod0_series), \
+        f"Module 0 should stay constant. Got: {mod0_series[0]} -> {mod0_series[-1]}"
+
+    print(f"\n  Check 2: Each module only increases, never decreases (no cancellation)")
+    for m in range(num_modules):
+        series = [p[m] for p in phase_history]
+        decreases = sum(1 for i in range(1, len(series)) if series[i] < series[i-1] - 1e-6)
+        increases = sum(1 for i in range(1, len(series)) if series[i] > series[i-1] + 1e-6)
+        print(f"    Module {m}: {increases} increases, {decreases} decreases")
+        assert decreases == 0, f"Module {m} should never decrease. Got {decreases} decreases"
+
+    print(f"\n  Check 3: Monotonic chain pattern m0 <= m1 <= m2 (m3 independent)")
+    for step, ph in enumerate(phase_history):
+        if step > 0 and step % 10 == 0:
+            assert ph[0] <= ph[1] + 1e-6 <= ph[2] + 1e-6, \
+                f"Step {step}: Chain pattern broken. Phases: {ph[:3]}"
+
+    print(f"\n  Check 4: accumulated_phases show clear growing trend")
+    summary = suppressor.get_resonance_summary()
+    acc = summary["accumulated_phases"]
+    print(f"    accumulated: {acc}")
+    assert acc[0] == 0.0, f"Module 0 accumulated should be 0, got {acc[0]}"
+    assert acc[1] > 0.3, f"Module 1 should grow, got {acc[1]}"
+    assert acc[2] > acc[1], f"Module 2 should grow more than m1: {acc[2]} vs {acc[1]}"
+
+    print("  PASSED")
+
+
+def test_reset_state_all_modules():
+    print("Test 12: Reset state clears all accumulated history")
+
+    num_modules = 3
+    suppressor = ResonanceSuppressor(
+        num_modules=num_modules,
+        frequency_threshold=0.3,
+        max_phase_shift=1.0,
+        adaptivity_rate=0.5,
+    )
+    decays = torch.ones(num_modules) * 1e-4
+    base_phases = torch.zeros(num_modules)
+    oscillation_freqs = torch.tensor([0.25, 0.25, 0.25])
+
+    print("  Running 20 steps to accumulate state...")
+    for step in range(20):
+        suppressor(decays, base_phases, oscillation_freqs)
+
+    summary_before = suppressor.get_resonance_summary()
+    cp_before = suppressor.correction_phases.detach().clone()
+    counters_before = suppressor.resonance_counters.sum().item()
+    print(f"  Before reset: correction_phases={cp_before.tolist()}, "
+          f"total_counter={counters_before:.4f}")
+    assert cp_before.abs().sum() > 0.1, "Should have accumulated phase shifts"
+    assert counters_before > 0.1, "Should have accumulated resonance counters"
+
+    print("  Calling reset_state()")
+    suppressor.reset_state()
+
+    summary_after = suppressor.get_resonance_summary()
+    cp_after = suppressor.correction_phases.detach().clone()
+    counters_after = suppressor.resonance_counters.sum().item()
+    amp_after = suppressor.amplitude_modulation.detach().clone()
+
+    print(f"  After reset: correction_phases={cp_after.tolist()}, "
+          f"total_counter={counters_after:.4f}")
+
+    print("\n  Check 1: correction_phases all zero")
+    assert torch.allclose(cp_after, torch.zeros_like(cp_after), atol=1e-8), \
+        f"correction_phases not reset: {cp_after.tolist()}"
+
+    print("  Check 2: resonance_counters all zero")
+    assert counters_after < 1e-8, f"resonance_counters not reset: {counters_after}"
+
+    print("  Check 3: accumulated_phases (buffer) also zero")
+    assert all(abs(v) < 1e-8 for v in summary_after["accumulated_phases"]), \
+        f"accumulated_phases not reset: {summary_after['accumulated_phases']}"
+
+    print("  Check 4: amplitude_modulation reset to 1.0")
+    assert torch.allclose(amp_after, torch.ones_like(amp_after), atol=1e-8), \
+        f"amplitude_modulation not reset: {amp_after.tolist()}"
+
+    print("  Check 5: Subsequent runs re-accumulate correctly (not broken)")
+    for step in range(10):
+        suppressor(decays, base_phases, oscillation_freqs)
+    cp_re = suppressor.correction_phases.detach()
+    print(f"    After 10 more steps: {cp_re.tolist()}")
+    assert cp_re[0].item() < 1e-6, "Module 0 still shouldn't move after reset"
+    assert cp_re[1].item() > 0.05 or cp_re[2].item() > 0.05, \
+        f"Should re-accumulate after reset. Got {cp_re.tolist()}"
+
+    print("  PASSED")
+
+
+def test_pmwd_reset_state_end_to_end():
+    print("Test 13: PhaseModulatedWeightDecay.reset_state() end-to-end")
+
+    base_decay = 1e-4
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = nn.Linear(10, 15)
+            self.layer2 = nn.Linear(15, 5)
+        def forward(self, x):
+            x = torch.relu(self.layer1(x))
+            return self.layer2(x)
+
+    model = TinyModel()
+    pmwd = PhaseModulatedWeightDecay(
+        modules=model,
+        base_decay=base_decay,
+        num_frequencies=4,
+    )
+
+    X = torch.randn(32, 10)
+    y = torch.randint(0, 5, (32,))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    print("  Running 30 training steps...")
+    for step in range(30):
+        optimizer.zero_grad()
+        loss = criterion(model(X), y)
+        loss.backward()
+        optimizer.step()
+        pmwd.apply_decay(step / 100, return_info=(step == 29))
+
+    diag_before = pmwd.get_diagnostics()
+    print(f"  Before reset: decays={list(diag_before['current_decays'].values())}")
+
+    acc_before = diag_before["resonance"]["accumulated_phases"]
+    if any(abs(v) > 1e-6 for v in acc_before):
+        print(f"    accumulated phases before: {acc_before}")
+
+    print("  Calling pmwd.reset_state()")
+    pmwd.reset_state()
+
+    diag_after = pmwd.get_diagnostics()
+    acc_after = diag_after["resonance"]["accumulated_phases"]
+    print(f"  After reset: decays={list(diag_after['current_decays'].values())}")
+    print(f"    accumulated phases after: {acc_after}")
+
+    print("\n  Check 1: Current decays back to base_decay")
+    for name, decay in diag_after["current_decays"].items():
+        assert abs(decay - base_decay) / base_decay < 0.01, \
+            f"{name} decay not reset: {decay}, expected {base_decay}"
+
+    print("  Check 2: Resonance phases and counters cleared")
+    assert all(abs(v) < 1e-6 for v in acc_after), \
+        f"Resonance accumulated phases not reset: {acc_after}"
+    assert diag_after["resonance"]["total_resonance"] < 1e-6, \
+        f"Resonance counters not reset: {diag_after['resonance']['total_resonance']}"
+
+    print("  Check 3: Energy statistics cleared")
+    energy = diag_after["energy"]
+    if energy:
+        assert energy.get("ema_energy", 0) < 1e-8 or len(energy) == 0, \
+            f"Energy stats not reset: {energy}"
 
     print("  PASSED")
 
@@ -450,6 +645,9 @@ if __name__ == "__main__":
         test_small_base_decay_not_amplified()
         test_energy_consistency_final_decay()
         test_resonance_phase_continuous_adjustment()
+        test_multi_module_multi_group_resonance()
+        test_reset_state_all_modules()
+        test_pmwd_reset_state_end_to_end()
 
         print("\n" + "=" * 50)
         print("All tests PASSED!")

@@ -95,6 +95,12 @@ class ResonanceSuppressor(nn.Module):
         """
         执行共振抑制，输出修正后的衰减系数和相位偏移
 
+        确定性相位调整规则（避免两个模块同步偏移或来回抵消）：
+        1. 只处理 i < j 的相邻对（上三角），避免 (i,j) 和 (j,i) 重复处理
+        2. 对每对 (i,j) 且 i<j，永远只调整 j（索引较大者），绝不调整 i
+        3. 调整方向固定为 +1（让 j 的相位单调增加），绝不因当前相位差改变方向
+        4. 因此 j 只会被它的左侧邻居推动，不会被右侧邻居反向拉回，趋势稳定
+
         Args:
             decay_coefficients: 原始衰减系数，形状 [num_modules]
             base_phase_shifts: 原始相位偏移，形状 [num_modules]
@@ -132,25 +138,22 @@ class ResonanceSuppressor(nn.Module):
         per_module_resonance = self.resonance_counters.sum(dim=1)
 
         phase_increment = torch.zeros_like(base_phase_shifts)
-        for i in range(self.num_modules):
-            for j in range(self.num_modules):
-                if i == j or self.adjacency[i, j] < 0.5:
-                    continue
-                if self.resonance_counters[i, j] > 0.3:
-                    if per_module_resonance[i] >= per_module_resonance[j]:
-                        current_phase_i = self.correction_phases[i].item()
-                        current_phase_j = self.correction_phases[j].item()
-                        phase_ij = current_phase_i - current_phase_j
-                        sign = 1.0 if phase_ij >= 0 else -1.0
 
-                        strength = min(self.resonance_counters[i, j].item(), 1.0)
-                        increment = sign * self.max_phase_shift * strength * self.adaptivity_rate
-                        phase_increment[i] += increment
+        for i in range(self.num_modules):
+            for j in range(i + 1, self.num_modules):
+                if self.adjacency[i, j] < 0.5:
+                    continue
+                if self.resonance_counters[i, j] <= 0.3:
+                    continue
+
+                strength = min(self.resonance_counters[i, j].item(), 1.0)
+                increment = self.max_phase_shift * strength * self.adaptivity_rate
+                phase_increment[j] += increment
 
         with torch.no_grad():
             self.correction_phases.add_(phase_increment)
             self.correction_phases.copy_(
-                torch.clamp(self.correction_phases, -2 * math.pi, 2 * math.pi)
+                torch.clamp(self.correction_phases, -2 * math.pi, 4 * math.pi)
             )
 
         self.accumulated_phase_shifts.copy_(self.correction_phases.detach())
@@ -177,9 +180,12 @@ class ResonanceSuppressor(nn.Module):
         }
 
     def reset_state(self) -> None:
-        """重置内部状态"""
+        """重置内部状态，包括累积的相位偏移和共振计数"""
         self.accumulated_phase_shifts.zero_()
         self.resonance_counters.zero_()
+        with torch.no_grad():
+            self.correction_phases.zero_()
+            self.amplitude_modulation.fill_(1.0)
 
     def extra_repr(self) -> str:
         return (

@@ -339,6 +339,14 @@ class PhaseModulatedWeightDecay(nn.Module):
 
         return step
 
+    def reset_state(self) -> None:
+        """重置所有子模块的累积状态，用于新阶段训练开始前"""
+        self.module_decay.reset_history()
+        self.resonance_suppressor.reset_state()
+        self.energy_regulator.reset_state()
+        with torch.no_grad():
+            self._current_decays.fill_(self.base_decay)
+
     def extra_repr(self) -> str:
         return (
             f"num_modules={self.num_modules}, "
